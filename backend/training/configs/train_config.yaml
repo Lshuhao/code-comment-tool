@@ -1,0 +1,120 @@
+# CodeBERT 微调训练配置
+# 基于 CodeSearchNet 数据集训练代码-注释语义匹配模型
+
+# ========================
+# 模型配置
+# ========================
+model:
+  # 预训练模型（HuggingFace模型名或本地路径）
+  base_model: "microsoft/codebert-base"
+  # 最大序列长度（CodeSearchNet代码通常较长）
+  max_seq_length: 512
+  # 输出目录
+  output_dir: "./models/finetuned_codebert"
+  # 是否保存到 HuggingFace Hub
+  push_to_hub: false
+  hub_model_id: ""
+
+# ========================
+# 数据配置
+# ========================
+data:
+  # CodeSearchNet 数据目录（下载后解压到此路径）
+  raw_data_dir: "./data/codesearchnet"
+  # 预处理后的训练数据路径
+  processed_train: "./data/train_pairs.jsonl"
+  processed_valid: "./data/valid_pairs.jsonl"
+  processed_test: "./data/test_pairs.jsonl"
+  # 使用的编程语言（CodeSearchNet支持: python, java, go, php, ruby, javascript）
+  languages:
+    - python
+    - java
+    # - go
+    # - php
+    # - ruby
+    # - javascript
+  # 每个语言最大采样数（防止数据不平衡）
+  max_samples_per_lang: 100000
+  # 文档字符串最短长度（过滤无意义注释）
+  min_docstring_len: 10
+  # 文档字符串最大长度
+  max_docstring_len: 512
+  # 代码最大token数
+  max_code_tokens: 384
+
+# ========================
+# 训练超参数
+# ========================
+training:
+  # 训练轮数
+  epochs: 5
+  # 批次大小（根据GPU显存调整：16GB VRAM 建议 batch_size=32）
+  batch_size: 32
+  # 评估批次大小
+  eval_batch_size: 64
+  # 学习率
+  learning_rate: 2.0e-5
+  # 权重衰减
+  weight_decay: 0.01
+  # warmup比例
+  warmup_ratio: 0.1
+  # 损失函数: multiple_negatives_ranking / cosine_similarity
+  loss_function: "multiple_negatives_ranking"
+  # 温度系数（用于对比学习）
+  temperature: 0.05
+  # 梯度累积步数
+  gradient_accumulation_steps: 2
+  # 最大梯度范数
+  max_grad_norm: 1.0
+  # 随机种子
+  seed: 42
+  # fp16混合精度训练
+  fp16: true
+  # 数据加载线程数
+  dataloader_num_workers: 4
+
+# ========================
+# 评估配置
+# ========================
+evaluation:
+  # 每隔多少步评估一次
+  eval_steps: 500
+  # 每隔多少步保存检查点
+  save_steps: 1000
+  # 评估指标
+  metrics:
+    - "mrr"        # Mean Reciprocal Rank
+    - "recall@1"
+    - "recall@5"
+    - "recall@10"
+  # 早停patience（连续N次评估无提升则停止）
+  early_stopping_patience: 3
+  # 监控指标
+  monitor_metric: "mrr"
+  monitor_mode: "max"
+
+# ========================
+# 日志配置
+# ========================
+logging:
+  # 日志步长
+  logging_steps: 50
+  # 是否使用 wandb
+  use_wandb: false
+  wandb_project: "codebert-codesearchnet"
+  wandb_run_name: ""
+  # tensorboard 日志目录
+  tensorboard_dir: "./logs/tensorboard"
+
+# ========================
+# 推理服务配置
+# ========================
+inference:
+  # 推理时加载的微调模型路径
+  model_path: "./models/finetuned_codebert"
+  # 语义相似度阈值（低于此值判定为不一致）
+  inconsistency_threshold: 0.25
+  # 冗余检测阈值
+  redundancy_threshold: 0.85
+  # 批推理大小
+  batch_size: 64

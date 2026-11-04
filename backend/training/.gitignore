@@ -1,0 +1,20 @@
+# 训练数据（大文件）
+data/
+*.jsonl
+*.tar.gz
+
+# 训练输出模型
+models/
+*.bin
+*.safetensors
+*.pt
+
+# 训练日志
+logs/
+wandb/
+runs/
+
+# Python缓存
+__pycache__/
+*.pyc
+.eggs/

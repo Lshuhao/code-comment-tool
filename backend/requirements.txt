@@ -1,0 +1,34 @@
+# 核心依赖（Python 3.10+）
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+python-multipart>=0.0.5
+chardet>=5.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+jinja2>=3.1.0
+aiofiles>=23.0.0
+httpx>=0.25.0
+
+# tree-sitter（AST解析）
+tree-sitter>=0.20.0
+tree-sitter-python>=0.20.0
+tree-sitter-java>=0.20.0
+tree-sitter-cpp>=0.20.0
+
+# LLM 客户端
+openai>=1.0.0
+
+# 数据库（可选）
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+python-jose[cryptography]>=3.3.0
+
+# Redis（可选，默认使用内存）
+# redis>=5.0.0
+
+# CodeBERT 语义检测（可选）
+# sentence-transformers>=2.2.2
+# numpy>=1.24.0
+
+# PDF导出（可选）
+# weasyprint>=60.0
