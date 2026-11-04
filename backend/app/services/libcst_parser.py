@@ -340,6 +340,43 @@ class AddDocstringTransformer(cst.CSTTransformer):
         self.docstrings = docstrings
         self.added_count = 0
 
+    def _format_docstring(self, text: str, indent: str) -> str:
+        """格式化多行docstring，保留相对缩进"""
+        lines = text.strip().split("\n")
+        if len(lines) == 1:
+            return f'"""{lines[0].strip()}"""'
+
+        # 计算非空行的最小缩进（作为基准）
+        min_indent = None
+        for line in lines[1:]:
+            if line.strip():
+                stripped_len = len(line) - len(line.lstrip())
+                if min_indent is None or stripped_len < min_indent:
+                    min_indent = stripped_len
+        if min_indent is None:
+            min_indent = 0
+
+        # 首行紧跟引号
+        formatted = [f'"""{lines[0].strip()}']
+        for line in lines[1:]:
+            if not line.strip():
+                formatted.append("")
+            else:
+                # 保留相对缩进：去除基准缩进后，加函数体缩进
+                relative = line[min_indent:]
+                formatted.append(f"{indent}{relative}")
+        formatted.append(f'{indent}"""')
+        return "\n".join(formatted)
+
+    def _get_indent_str(self, body) -> str:
+        """从 CST 节点获取缩进字符串"""
+        if isinstance(body, cst.IndentedBlock) and body.indent:
+            indent_obj = body.indent
+            if hasattr(indent_obj, "value"):
+                return indent_obj.value
+            return str(indent_obj)
+        return "    "
+
     def leave_FunctionDef(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
     ) -> cst.FunctionDef:
@@ -352,15 +389,15 @@ class AddDocstringTransformer(cst.CSTTransformer):
             return updated_node
 
         docstring_text = self.docstrings[name]
-        # 构造 docstring 节点
-        docstring_expr = cst.Expr(
-            value=cst.SimpleString(f'"""{docstring_text}"""')
-        )
 
         # 获取函数体缩进
-        indent = "    "
-        if isinstance(updated_node.body, cst.IndentedBlock):
-            indent = updated_node.body.indent
+        indent = self._get_indent_str(updated_node.body)
+
+        # 构造 docstring 节点（多行时内部行需要正确缩进）
+        formatted = self._format_docstring(docstring_text, indent)
+        docstring_expr = cst.Expr(
+            value=cst.SimpleString(formatted)
+        )
 
         # 在函数体开头插入 docstring
         new_body_stmts = [
@@ -399,13 +436,13 @@ class AddDocstringTransformer(cst.CSTTransformer):
             return updated_node
 
         docstring_text = self.docstrings[name]
-        docstring_expr = cst.Expr(
-            value=cst.SimpleString(f'"""{docstring_text}"""')
-        )
 
-        indent = "    "
-        if isinstance(updated_node.body, cst.IndentedBlock):
-            indent = updated_node.body.indent
+        indent = self._get_indent_str(updated_node.body)
+
+        formatted = self._format_docstring(docstring_text, indent)
+        docstring_expr = cst.Expr(
+            value=cst.SimpleString(formatted)
+        )
 
         new_body_stmts = [
             cst.SimpleStatementLine(body=[docstring_expr], leading_lines=[])

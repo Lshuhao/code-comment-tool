@@ -52,8 +52,8 @@ def main():
     print("=" * 60)
     print()
 
-    gui_script = BACKEND_DIR / "app" / "gui" / "app.py"
-    os.execv(sys.executable, [sys.executable, str(gui_script)])
+    gui_script = str(BACKEND_DIR / "app" / "gui" / "app.py")
+    subprocess.run([sys.executable, gui_script])
 
 
 if __name__ == "__main__":

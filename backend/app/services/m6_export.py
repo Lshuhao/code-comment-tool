@@ -61,13 +61,7 @@ class ExportService:
 
         result_code = original_code
 
-        # 1. 优先用 LibCST Codemod 处理 docstring（保留所有格式）
-        if docstring_suggestions:
-            result_code = self._apply_docstrings_libcst(
-                result_code, docstring_suggestions, parse_result
-            )
-
-        # 2. 行内注释和其他类型用手动插入
+        # 1. 先处理行内注释（手动倒序插入，基于原始行号，避免偏移）
         if other_suggestions:
             insertions = self._calculate_insertions(
                 other_suggestions, parse_result, result_code
@@ -77,6 +71,12 @@ class ExportService:
             for ins in insertions:
                 lines = self._insert_at(lines, ins)
             result_code = "\n".join(lines)
+
+        # 2. 再用 LibCST Codemod 处理 docstring（按函数名匹配，不受行号影响）
+        if docstring_suggestions:
+            result_code = self._apply_docstrings_libcst(
+                result_code, docstring_suggestions, parse_result
+            )
 
         return result_code
 
@@ -269,10 +269,15 @@ class ExportService:
         lines: List[str],
         language: str,
     ) -> Optional[InsertionPoint]:
-        """生成行内注释插入点"""
-        target_idx = node.start_line - 1
-        if target_idx >= len(lines):
-            return None
+        """生成行内注释插入点（使用建议的 target_line，支持函数内定位）"""
+        # 优先使用 suggestion.target_line（可能定位到函数体内的复杂语句行）
+        line_no = suggestion.target_line or node.start_line
+        target_idx = line_no - 1
+        if target_idx < 0 or target_idx >= len(lines):
+            target_idx = node.start_line - 1
+            line_no = node.start_line
+            if target_idx < 0 or target_idx >= len(lines):
+                return None
 
         target_line = lines[target_idx]
         indent = self._get_indent(target_line)
@@ -283,7 +288,7 @@ class ExportService:
 
         # 插入在目标行之前
         return InsertionPoint(
-            line_number=node.start_line,
+            line_number=line_no,
             text=text,
             indent=indent,
             node_id=node.node_id,

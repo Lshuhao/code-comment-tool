@@ -168,6 +168,8 @@ class AnalysisPage(ttk.Frame):
         self.progress.start(10)
         self.status_label.config(text="分析中...")
 
+        root = self.winfo_toplevel()  # 主窗口引用，用于线程安全的UI更新
+
         def do_analysis():
             try:
                 from app.services.m1_ingest import ingest_service
@@ -180,17 +182,27 @@ class AnalysisPage(ttk.Frame):
 
                 # M1: 接入
                 ingest = ingest_service.ingest_text(code, filename, lang_hint)
+                root.after(0, lambda: self.status_label.config(text="解析代码..."))
 
                 # M2: 解析
                 parse = parse_code(ingest.code_text, ingest.language)
+                root.after(0, lambda: self.status_label.config(text="生成注释..."))
 
-                # M3: 注释生成
+                # M3: 注释生成（流式）
                 llm = LLMClientFactory.create()
                 comment_gen = CommentGenerationService(llm_client=llm)
                 import asyncio
                 loop = asyncio.new_event_loop()
                 suggestions = loop.run_until_complete(comment_gen.generate_all(parse))
                 loop.close()
+
+                # 获取Token统计
+                usage = llm.get_usage() if hasattr(llm, 'get_usage') else None
+                token_info = ""
+                if usage and usage.total_tokens > 0:
+                    token_info = f" | Token: {usage.total_tokens} | 费用: ${usage.cost_usd:.4f}"
+
+                root.after(0, lambda: self.status_label.config(text=f"检测缺陷{token_info}..."))
 
                 # M4: 缺陷检测
                 loop2 = asyncio.new_event_loop()
@@ -209,6 +221,7 @@ class AnalysisPage(ttk.Frame):
                     "score": score.to_dict(),
                     "original_code": ingest.code_text,
                     "annotated_code": None,
+                    "token_info": token_info,
                 }
             except Exception as e:
                 return {"error": str(e)}
@@ -255,7 +268,11 @@ class AnalysisPage(ttk.Frame):
                 self.annot_text.insert("1.0", annotated)
                 self.annot_text.config(state=tk.DISABLED)
 
-                self.status_label.config(text=f"分析完成 | 评分: {result.get('score', {}).get('score', 0):.1f} | 已自动生成 {len(suggestions)} 条注释")
+                self.status_label.config(
+                    text=f"分析完成 | 评分: {result.get('score', {}).get('score', 0):.1f}"
+                         f" | 已生成 {len(result.get('suggestions', []))} 条注释"
+                         f"{result.get('token_info', '')}"
+                )
 
                 # 同步到历史记录页
                 app = self.app_ref
@@ -395,18 +412,26 @@ class AnalysisPage(ttk.Frame):
 # ========================
 
 class HistoryPage(ttk.Frame):
-    """历史记录标签页"""
+    """历史记录标签页 - 支持JSON持久化存储"""
+
+    _DATA_FILE = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data", "history.json"
+    )
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self._records = []
+        self._load_from_file()
         self._build_ui()
+        self._refresh()
 
     def _build_ui(self):
         ttk.Label(self, text="分析历史记录", font=("Microsoft YaHei", 13, "bold")).pack(fill=tk.X, pady=8)
 
-        columns = ("filename", "language", "score", "suggestions", "defects", "time")
+        columns = ("id", "filename", "language", "score", "suggestions", "defects", "time")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=15)
+        self.tree.heading("id", text="ID")
         self.tree.heading("filename", text="文件名")
         self.tree.heading("language", text="语言")
         self.tree.heading("score", text="评分")
@@ -414,6 +439,7 @@ class HistoryPage(ttk.Frame):
         self.tree.heading("defects", text="缺陷数")
         self.tree.heading("time", text="分析时间")
 
+        self.tree.column("id", width=0, minwidth=0, stretch=False)  # 隐藏ID列
         self.tree.column("filename", width=180, minwidth=100)
         self.tree.column("language", width=80, minwidth=60)
         self.tree.column("score", width=80, minwidth=50)
@@ -421,20 +447,57 @@ class HistoryPage(ttk.Frame):
         self.tree.column("defects", width=80, minwidth=50)
         self.tree.column("time", width=160, minwidth=100)
 
-        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        # 滚动条和Treeview用Frame包裹，确保布局正确
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 双击查看详情
+        self.tree.bind("<Double-1>", lambda e: self._show_detail())
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(btn_frame, text="查看详情", command=self._show_detail).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btn_frame, text="删除选中", command=self._delete_selected).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="清空全部", command=self._clear_all).pack(side=tk.RIGHT, padx=4)
 
         self.status = ttk.Label(btn_frame, text="")
         self.status.pack(side=tk.LEFT)
 
+    def _load_from_file(self):
+        """从JSON文件加载历史记录"""
+        if os.path.exists(self._DATA_FILE):
+            try:
+                import json
+                with open(self._DATA_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._records = data.get("records", [])
+            except Exception:
+                self._records = []
+
+    def _save_to_file(self):
+        """保存历史记录到JSON文件"""
+        try:
+            import json
+            os.makedirs(os.path.dirname(self._DATA_FILE), exist_ok=True)
+            # 不保存 _raw 中的大字段（parse树），只保留摘要
+            save_records = []
+            for r in self._records:
+                rec = {k: v for k, v in r.items() if k != "_raw"}
+                save_records.append(rec)
+            with open(self._DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"records": save_records}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     def add_record(self, task_data: dict):
+        import uuid
         record = {
+            "id": str(uuid.uuid4())[:8],
             "filename": task_data.get("ingest", {}).get("filename", "unknown"),
             "language": task_data.get("ingest", {}).get("language", "unknown"),
             "score": task_data.get("score", {}).get("score", 0),
@@ -444,27 +507,99 @@ class HistoryPage(ttk.Frame):
             "_raw": task_data,
         }
         self._records.insert(0, record)
+        self._save_to_file()
         self._refresh()
 
     def _refresh(self):
         self.tree.delete(*self.tree.get_children())
         for r in self._records:
-            self.tree.insert("", "end", values=(
-                r["filename"], r["language"], f"{r['score']:.1f}",
+            score_color = ""
+            s = r.get("score", 0)
+            self.tree.insert("", "end", iid=r["id"], values=(
+                r["id"], r["filename"], r["language"], f"{s:.1f}",
                 r["suggestions"], r["defects"], r["time"],
             ))
         self.status.config(text=f"共 {len(self._records)} 条记录")
 
+    def _get_selected_record(self):
+        """获取选中记录的完整数据"""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        record_id = sel[0]
+        for r in self._records:
+            if r.get("id") == record_id:
+                return r
+        return None
+
+    def _show_detail(self):
+        """查看详情对话框"""
+        record = self._get_selected_record()
+        if not record:
+            messagebox.showinfo("提示", "请先选中一条记录")
+            return
+
+        raw = record.get("_raw", {})
+        dialog = tk.Toplevel(self)
+        dialog.title(f"分析详情 - {record['filename']}")
+        dialog.geometry("700x500")
+        dialog.transient(self.winfo_toplevel())
+
+        # 评分信息
+        info_frame = ttk.LabelFrame(dialog, text="评分信息")
+        info_frame.pack(fill=tk.X, padx=8, pady=4)
+        score = record.get("score", 0)
+        dims = raw.get("score", {}).get("dimensions", {})
+        ttk.Label(info_frame,
+                  text=f"综合评分: {score:.1f}  |  覆盖率: {dims.get('coverage', 0):.0f}%  |  "
+                       f"完整性: {dims.get('completeness', 0):.0f}%  |  "
+                       f"一致性: {dims.get('consistency', 0):.0f}%  |  "
+                       f"规范性: {dims.get('standard', 0):.0f}%").pack(padx=8, pady=4)
+
+        # 摘要
+        summary = raw.get("score", {}).get("summary", "")
+        if summary:
+            ttk.Label(dialog, text=summary, foreground="#3b82f6", wraplength=650).pack(padx=8, pady=2)
+
+        # 原始代码
+        code_frame = ttk.LabelFrame(dialog, text="原始代码")
+        code_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        code_text = scrolledtext.ScrolledText(code_frame, wrap=tk.NONE, font=("Consolas", 10), height=12)
+        code_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        code_text.insert("1.0", raw.get("original_code", ""))
+        code_text.config(state=tk.DISABLED)
+
+        # 注释后代码
+        annot_code = raw.get("annotated_code", "")
+        if annot_code:
+            annot_frame = ttk.LabelFrame(dialog, text="注释后代码")
+            annot_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+            annot_text = scrolledtext.ScrolledText(annot_frame, wrap=tk.NONE, font=("Consolas", 10), height=8, bg="#f0fff0")
+            annot_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+            annot_text.insert("1.0", annot_code)
+            annot_text.config(state=tk.DISABLED)
+
+        ttk.Button(dialog, text="关闭", command=dialog.destroy).pack(pady=8)
+
     def _delete_selected(self):
         sel = self.tree.selection()
         if not sel:
+            messagebox.showinfo("提示", "请先选中要删除的记录")
             return
-        if not messagebox.askyesno("确认", "删除选中的历史记录？"):
+        if not messagebox.askyesno("确认", f"删除选中的 {len(sel)} 条记录？"):
             return
-        for item in sel:
-            idx = self.tree.index(item)
-            if 0 <= idx < len(self._records):
-                del self._records[idx]
+        ids_to_delete = set(sel)
+        self._records = [r for r in self._records if r.get("id") not in ids_to_delete]
+        self._save_to_file()
+        self._refresh()
+
+    def _clear_all(self):
+        if not self._records:
+            return
+        if not messagebox.askyesno("确认", "清空所有历史记录？此操作不可恢复。"):
+            return
+        self._records.clear()
+        self._save_to_file()
         self._refresh()
 
 
@@ -472,166 +607,309 @@ class HistoryPage(ttk.Frame):
 # Tab 3: 模型设置页
 # ========================
 
+# API 格式友好名称映射
+_API_FORMAT_LABELS = {
+    "openai_chat": "OpenAI 兼容（DeepSeek / 千问 / 智谱等）",
+    "anthropic_messages": "Anthropic Messages",
+    "google_genai": "Google Generative AI",
+    "custom": "自定义",
+}
+
+
 class ModelSettingsPage(ttk.Frame):
-    """模型设置标签页"""
+    """模型设置标签页 - 简洁版"""
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self._providers = []
         self._selected_id = None
+        self._building = True  # 防止构建时触发自动保存
         self._build_ui()
         self._load_providers()
+        self._building = False
 
     def _build_ui(self):
-        ttk.Label(self, text="模型设置", font=("Microsoft YaHei", 13, "bold")).pack(fill=tk.X, pady=8)
+        # 标题栏
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X, pady=(8, 4))
+        ttk.Label(header, text="模型设置", font=("Microsoft YaHei", 13, "bold")).pack(side=tk.LEFT, padx=8)
+        ttk.Button(header, text="＋ 添加供应商", command=self._add_provider).pack(side=tk.RIGHT, padx=8)
 
         # 左右分栏
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        # 左侧：供应商列表
-        left = ttk.LabelFrame(main, text="供应商列表")
-        self.provider_listbox = tk.Listbox(left, font=("Microsoft YaHei", 11), height=15, width=20)
-        self.provider_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.provider_listbox.bind("<<ListboxSelect>>", self._on_select_provider)
-        ttk.Button(left, text="+ 添加供应商", command=self._add_provider).pack(fill=tk.X, padx=4, pady=4)
-        main.add(left, weight=0)
+        # === 左侧：供应商列表 ===
+        left_frame = ttk.Frame(main, width=180)
+        left_frame.pack_propagate(False)
 
-        # 右侧：详情面板
-        right = ttk.LabelFrame(main, text="配置详情")
-        right_inner = ttk.Frame(right)
-        right_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        ttk.Label(left_frame, text="供应商", font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#666").pack(anchor=tk.W, padx=8, pady=(4, 2))
 
-        # 供应商名
-        row = ttk.Frame(right_inner)
-        row.pack(fill=tk.X, pady=4)
-        ttk.Label(row, text="名称:", width=8).pack(side=tk.LEFT)
+        # 用 Treeview 替代 Listbox，显示更多信息
+        columns = ("name", "status")
+        self.provider_tree = ttk.Treeview(left_frame, columns=columns, show="tree", selectmode="browse")
+        self.provider_tree.column("#0", width=0, minwidth=0)
+        self.provider_tree.column("name", width=120)
+        self.provider_tree.column("status", width=30)
+        self.provider_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+        self.provider_tree.bind("<<TreeviewSelect>>", self._on_select_provider)
+
+        # 分组标签
+        self._builtin_id = self.provider_tree.insert("", "end", text="── 内置 ──", open=True, tags=("header",))
+        self._custom_id = self.provider_tree.insert("", "end", text="── 自定义 ──", open=True, tags=("header",))
+        self.provider_tree.tag_configure("header", foreground="#999", font=("Microsoft YaHei", 9))
+
+        main.add(left_frame, weight=0)
+
+        # === 右侧：配置面板 ===
+        right_frame = ttk.Frame(main)
+        right_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 空状态提示
+        self.empty_label = ttk.Label(right_frame, text="← 请从左侧选择一个供应商",
+                                      font=("Microsoft YaHei", 11), foreground="#999")
+        self.empty_label.pack(expand=True)
+
+        # 配置内容（初始隐藏）
+        self.config_frame = ttk.Frame(right_frame)
+
+        # 名称 + 启用开关
+        row = ttk.Frame(self.config_frame)
+        row.pack(fill=tk.X, pady=(10, 6))
         self.name_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.name_var, font=("Microsoft YaHei", 12, "bold")).pack(side=tk.LEFT, padx=8)
+        ttk.Label(row, textvariable=self.name_var, font=("Microsoft YaHei", 14, "bold")).pack(side=tk.LEFT)
         self.enable_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="启用", variable=self.enable_var, command=self._toggle_enable).pack(side=tk.RIGHT)
+        ttk.Checkbutton(row, text="启用", variable=self.enable_var,
+                        command=self._auto_save).pack(side=tk.RIGHT)
+
+        # 分隔线
+        ttk.Separator(self.config_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
         # Base URL
-        row = ttk.Frame(right_inner)
-        row.pack(fill=tk.X, pady=6)
-        ttk.Label(row, text="Base URL:", width=10).pack(side=tk.LEFT)
+        ttk.Label(self.config_frame, text="接口地址", font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#666").pack(anchor=tk.W)
         self.base_url_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.base_url_var, width=50).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.base_url_var.trace_add("write", lambda *_: self._auto_save())
+        ttk.Entry(self.config_frame, textvariable=self.base_url_var).pack(fill=tk.X, pady=(2, 8))
 
         # API 格式
-        row = ttk.Frame(right_inner)
-        row.pack(fill=tk.X, pady=6)
-        ttk.Label(row, text="API 格式:", width=10).pack(side=tk.LEFT)
+        ttk.Label(self.config_frame, text="接口类型", font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#666").pack(anchor=tk.W)
         self.api_format_var = tk.StringVar(value="openai_chat")
-        ttk.Combobox(row, textvariable=self.api_format_var,
-                      values=["openai_chat", "anthropic_messages", "google_genai", "custom"],
-                      width=30, state="readonly").pack(side=tk.LEFT, padx=4)
+        self.api_format_var.trace_add("write", lambda *_: self._auto_save())
+        format_combo = ttk.Combobox(self.config_frame, textvariable=self.api_format_var,
+                                     values=list(_API_FORMAT_LABELS.values()),
+                                     state="readonly")
+        format_combo.pack(fill=tk.X, pady=(2, 8))
+        # 反向映射：显示名 → 值
+        self._format_reverse = {v: k for k, v in _API_FORMAT_LABELS.items()}
 
         # API Key
-        row = ttk.Frame(right_inner)
-        row.pack(fill=tk.X, pady=6)
-        ttk.Label(row, text="API Key:", width=10).pack(side=tk.LEFT)
+        ttk.Label(self.config_frame, text="API 密钥", font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#666").pack(anchor=tk.W)
         self.api_key_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.api_key_var, show="•", width=50).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.api_key_var.trace_add("write", lambda *_: self._auto_save())
+        key_frame = ttk.Frame(self.config_frame)
+        key_frame.pack(fill=tk.X, pady=(2, 8))
+        ttk.Entry(key_frame, textvariable=self.api_key_var, show="•").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._show_key_btn = ttk.Button(key_frame, text="👁", width=3, command=self._toggle_key_visibility)
+        self._show_key_btn.pack(side=tk.RIGHT, padx=(4, 0))
 
-        ttk.Separator(right_inner).pack(fill=tk.X, pady=10)
+        # 分隔线
+        ttk.Separator(self.config_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
 
         # 模型列表
-        ttk.Label(right_inner, text="模型列表", font=("Microsoft YaHei", 10, "bold")).pack(anchor=tk.W, pady=4)
+        ttk.Label(self.config_frame, text="可用模型", font=("Microsoft YaHei", 9, "bold"),
+                  foreground="#666").pack(anchor=tk.W)
 
-        columns = ("model_id", "context", "vision", "enabled")
-        self.model_tree = ttk.Treeview(right_inner, columns=columns, show="headings", height=5)
-        self.model_tree.heading("model_id", text="模型ID")
+        model_columns = ("model_id", "model_name", "context", "vision", "enabled")
+        self.model_tree = ttk.Treeview(self.config_frame, columns=model_columns, show="headings", height=6)
+        self.model_tree.heading("model_id", text="模型 ID")
+        self.model_tree.heading("model_name", text="显示名称")
         self.model_tree.heading("context", text="上下文")
         self.model_tree.heading("vision", text="视觉")
         self.model_tree.heading("enabled", text="启用")
-        self.model_tree.column("model_id", width=150)
-        self.model_tree.column("context", width=80)
-        self.model_tree.column("vision", width=50)
-        self.model_tree.column("enabled", width=50)
-        self.model_tree.pack(fill=tk.X, pady=4)
+        self.model_tree.column("model_id", width=130)
+        self.model_tree.column("model_name", width=120)
+        self.model_tree.column("context", width=70)
+        self.model_tree.column("vision", width=40)
+        self.model_tree.column("enabled", width=40)
+        self.model_tree.pack(fill=tk.X, pady=(2, 6))
 
-        btn_row = ttk.Frame(right_inner)
-        btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(btn_row, text="+ 添加模型", command=self._add_model).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="测试连接", command=self._test_connection).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="保存", command=self._save_provider).pack(side=tk.RIGHT, padx=2)
+        # 模型操作按钮
+        btn_row = ttk.Frame(self.config_frame)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="＋ 添加模型", command=self._add_model).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="删除模型", command=self._delete_model).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="测试连接", command=self._test_connection).pack(side=tk.LEFT, padx=4)
 
-        main.add(right, weight=1)
+        self.config_frame.pack(fill=tk.BOTH, expand=True)
+        self.config_frame.pack_forget()  # 初始隐藏
+
+        main.add(right_frame, weight=1)
 
     def _load_providers(self):
         from app.models.llm_provider import provider_store
         self._providers = provider_store.list_providers()
-        self.provider_listbox.delete(0, tk.END)
+
+        # 清空列表（保留分组标题）
+        for item in self.provider_tree.get_children():
+            if item not in (self._builtin_id, self._custom_id):
+                self.provider_tree.delete(item)
+
         for p in self._providers:
-            icon = "●" if p.enabled else "○"
-            prefix = "  " if p.provider_type == "custom" else ""
-            self.provider_listbox.insert(tk.END, f"{prefix}{p.provider_name} {icon}")
+            status = "✓" if p.enabled else "○"
+            parent = self._custom_id if p.provider_type == "custom" else self._builtin_id
+            self.provider_tree.insert(parent, "end", iid=p.provider_id,
+                                       values=(p.provider_name, status))
 
     def _on_select_provider(self, event):
-        sel = self.provider_listbox.curselection()
+        sel = self.provider_tree.selection()
         if not sel:
             return
-        idx = sel[0]
-        if idx < len(self._providers):
-            p = self._providers[idx]
-            self._selected_id = p.provider_id
-            self.name_var.set(p.provider_name)
-            self.base_url_var.set(p.base_url)
-            self.api_format_var.set(p.api_format)
-            self.api_key_var.set(p.api_key)
-            self.enable_var.set(p.enabled)
+        provider_id = sel[0]
+        if provider_id in (self._builtin_id, self._custom_id):
+            return
 
-            # 更新模型列表
-            self.model_tree.delete(*self.model_tree.get_children())
-            for m in p.models:
-                self.model_tree.insert("", "end", values=(
-                    m.model_id,
-                    f"{m.max_context // 1000}K" if m.max_context >= 1000 else m.max_context,
-                    "是" if m.has_vision else "否",
-                    "✓" if m.enabled else "",
-                ))
+        provider = None
+        for p in self._providers:
+            if p.provider_id == provider_id:
+                provider = p
+                break
+        if not provider:
+            return
 
-    def _toggle_enable(self):
-        if not self._selected_id:
+        self._selected_id = provider_id
+        self._building = True
+
+        # 显示配置面板
+        self.empty_label.pack_forget()
+        self.config_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 填充数据
+        self.name_var.set(provider.provider_name)
+        self.base_url_var.set(provider.base_url)
+        self.api_key_var.set(provider.api_key)
+        self.enable_var.set(provider.enabled)
+
+        # API 格式：值 → 显示名
+        format_label = _API_FORMAT_LABELS.get(provider.api_format, provider.api_format)
+        self.api_format_var.set(format_label)
+
+        # 模型列表
+        self.model_tree.delete(*self.model_tree.get_children())
+        for m in provider.models:
+            ctx = f"{m.max_context // 1000}K" if m.max_context >= 1000 else str(m.max_context)
+            self.model_tree.insert("", "end", values=(
+                m.model_id,
+                m.model_name or m.model_id,
+                ctx,
+                "✓" if m.has_vision else "",
+                "✓" if m.enabled else "",
+            ))
+
+        self._building = False
+
+    def _auto_save(self):
+        """字段变化时自动保存"""
+        if self._building or not self._selected_id:
             return
         from app.models.llm_provider import provider_store
-        provider_store.toggle_provider(self._selected_id)
+        # 显示名 → 值
+        format_value = self._format_reverse.get(self.api_format_var.get(), self.api_format_var.get())
+        provider_store.update_provider(self._selected_id, {
+            "base_url": self.base_url_var.get(),
+            "api_format": format_value,
+            "api_key": self.api_key_var.get(),
+            "enabled": self.enable_var.get(),
+        })
+        # 刷新左侧状态图标
         self._load_providers()
+
+    def _toggle_key_visibility(self):
+        """切换 API Key 显示/隐藏"""
+        for child in self.config_frame.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for sub in child.winfo_children():
+                    if isinstance(sub, ttk.Entry):
+                        if sub.cget("show") == "•":
+                            sub.config(show="")
+                            self._show_key_btn.config(text="🔒")
+                            return
+                        else:
+                            sub.config(show="•")
+                            self._show_key_btn.config(text="👁")
+                            return
 
     def _add_provider(self):
         dialog = tk.Toplevel(self)
         dialog.title("添加供应商")
-        dialog.geometry("400x300")
+        dialog.geometry("420x280")
         dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
 
-        ttk.Label(dialog, text="供应商名称:").pack(anchor=tk.W, padx=10, pady=(10, 2))
-        name_entry = ttk.Entry(dialog, width=40)
-        name_entry.pack(padx=10, fill=tk.X)
+        ttk.Label(dialog, text="添加新供应商", font=("Microsoft YaHei", 12, "bold")).pack(pady=12)
 
-        ttk.Label(dialog, text="Base URL:").pack(anchor=tk.W, padx=10, pady=(10, 2))
-        url_entry = ttk.Entry(dialog, width=40)
-        url_entry.pack(padx=10, fill=tk.X)
-
-        ttk.Label(dialog, text="API Key:").pack(anchor=tk.W, padx=10, pady=(10, 2))
-        key_entry = ttk.Entry(dialog, width=40, show="•")
-        key_entry.pack(padx=10, fill=tk.X)
+        fields = {}
+        for label, key in [("供应商名称", "name"), ("接口地址", "url"), ("API 密钥", "key")]:
+            ttk.Label(dialog, text=label).pack(anchor=tk.W, padx=20, pady=(8, 2))
+            entry = ttk.Entry(dialog, width=45)
+            entry.pack(padx=20, fill=tk.X)
+            fields[key] = entry
 
         def do_add():
-            name = name_entry.get().strip()
+            name = fields["name"].get().strip()
             if not name:
-                messagebox.showwarning("提示", "请输入供应商名称")
+                messagebox.showwarning("提示", "请输入供应商名称", parent=dialog)
                 return
             from app.models.llm_provider import provider_store
             provider_store.create_provider({
                 "provider_name": name,
-                "base_url": url_entry.get().strip(),
+                "provider_type": "custom",
+                "base_url": fields["url"].get().strip(),
                 "api_format": "openai_chat",
-                "api_key": key_entry.get().strip(),
-                "models": [{"model_id": "default", "model_name": "Default", "max_context": 16384, "has_vision": False, "enabled": True}],
+                "api_key": fields["key"].get().strip(),
+                "models": [{"model_id": "default", "model_name": "Default Model",
+                            "max_context": 16384, "has_vision": False, "enabled": True}],
             })
             dialog.destroy()
             self._load_providers()
+            # 自动选中新添加的供应商
+            for child in self.provider_tree.get_children(self._custom_id):
+                self.provider_tree.selection_set(child)
+                break
+            self._on_select_provider(None)
+
+    def _delete_model(self):
+        """删除选中的模型"""
+        sel = self.model_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在模型列表中选一个模型")
+            return
+        if not messagebox.askyesno("确认", "删除选中的模型？"):
+            return
+
+        from app.models.llm_provider import provider_store
+        provider = provider_store.get_provider(self._selected_id)
+        if not provider:
+            return
+
+        # 获取选中模型的 ID
+        selected_ids = set()
+        for item in sel:
+            vals = self.model_tree.item(item)["values"]
+            selected_ids.add(vals[0])
+
+        # 过滤掉选中的模型（兼容 dict 和对象）
+        provider.models = [m for m in provider.models
+                          if (m.get("model_id") if isinstance(m, dict) else m.model_id) not in selected_ids]
+
+        provider_store.update_provider(self._selected_id, {
+            "models": [m.to_dict() if hasattr(m, 'to_dict') else m for m in provider.models],
+        })
+        self._load_providers()
+        self._on_select_provider(None)
 
         ttk.Button(dialog, text="确认添加", command=do_add).pack(pady=16)
 
@@ -641,28 +919,31 @@ class ModelSettingsPage(ttk.Frame):
             return
         dialog = tk.Toplevel(self)
         dialog.title("添加模型")
-        dialog.geometry("350x250")
+        dialog.geometry("380x260")
         dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
 
-        ttk.Label(dialog, text="模型ID:").pack(anchor=tk.W, padx=10, pady=(10, 2))
-        id_entry = ttk.Entry(dialog, width=35)
-        id_entry.pack(padx=10, fill=tk.X)
+        ttk.Label(dialog, text="添加新模型", font=("Microsoft YaHei", 12, "bold")).pack(pady=12)
 
-        ttk.Label(dialog, text="显示名称:").pack(anchor=tk.W, padx=10, pady=(10, 2))
-        name_entry = ttk.Entry(dialog, width=35)
-        name_entry.pack(padx=10, fill=tk.X)
+        ttk.Label(dialog, text="模型 ID").pack(anchor=tk.W, padx=20, pady=(8, 2))
+        id_entry = ttk.Entry(dialog, width=40)
+        id_entry.pack(padx=20, fill=tk.X)
 
-        ttk.Label(dialog, text="上下文长度:").pack(anchor=tk.W, padx=10, pady=(10, 2))
+        ttk.Label(dialog, text="显示名称").pack(anchor=tk.W, padx=20, pady=(8, 2))
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.pack(padx=20, fill=tk.X)
+
+        ttk.Label(dialog, text="上下文长度").pack(anchor=tk.W, padx=20, pady=(8, 2))
         ctx_var = tk.IntVar(value=16384)
-        ttk.Spinbox(dialog, textvariable=ctx_var, from_=1024, to=1000000, increment=4096, width=35).pack(padx=10, fill=tk.X)
+        ttk.Spinbox(dialog, textvariable=ctx_var, from_=1024, to=1000000, increment=4096, width=38).pack(padx=20, fill=tk.X)
 
         vision_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dialog, text="支持视觉", variable=vision_var).pack(anchor=tk.W, padx=10, pady=8)
+        ttk.Checkbutton(dialog, text="支持视觉（图片输入）", variable=vision_var).pack(anchor=tk.W, padx=20, pady=8)
 
         def do_add():
             mid = id_entry.get().strip()
             if not mid:
-                messagebox.showwarning("提示", "请输入模型ID")
+                messagebox.showwarning("提示", "请输入模型 ID", parent=dialog)
                 return
             from app.models.llm_provider import provider_store
             provider = provider_store.get_provider(self._selected_id)
@@ -680,21 +961,62 @@ class ModelSettingsPage(ttk.Frame):
             dialog.destroy()
             self._on_select_provider(None)
 
-        ttk.Button(dialog, text="确认", command=do_add).pack(pady=12)
+        ttk.Button(dialog, text="确认", command=do_add).pack(pady=16)
 
     def _test_connection(self):
         if not self._selected_id:
+            messagebox.showwarning("提示", "请先选择供应商")
             return
-        messagebox.showinfo("测试连接", f"测试 {self.name_var.get()} 的连接...\n（需要后端服务支持）")
 
-    def _save_provider(self):
-        if not self._selected_id:
+        # 获取第一个启用的模型
+        model_id = ""
+        for item in self.model_tree.get_children():
+            vals = self.model_tree.item(item)["values"]
+            if vals[4] == "✓":
+                model_id = vals[0]
+                break
+
+        if not model_id:
+            messagebox.showwarning("提示", "请先启用一个模型")
             return
-        from app.models.llm_provider import provider_store
-        provider_store.update_provider(self._selected_id, {
-            "base_url": self.base_url_var.get(),
-            "api_format": self.api_format_var.get(),
-            "api_key": self.api_key_var.get(),
-            "enabled": self.enable_var.get(),
-        })
-        self._load_providers()
+
+        # 显示值 → 格式值
+        format_value = self._format_reverse.get(self.api_format_var.get(), self.api_format_var.get())
+
+        test_dialog = tk.Toplevel(self)
+        test_dialog.title("测试连接")
+        test_dialog.geometry("320x120")
+        test_dialog.transient(self.winfo_toplevel())
+        test_dialog.resizable(False, False)
+        test_dialog.grab_set()
+
+        status_var = tk.StringVar(value="正在连接...")
+        ttk.Label(test_dialog, textvariable=status_var).pack(pady=15)
+
+        def do_test():
+            try:
+                from app.services.llm_client import DynamicLLMClient
+                import asyncio
+
+                client = DynamicLLMClient({
+                    "base_url": self.base_url_var.get(),
+                    "api_format": format_value,
+                    "api_key": self.api_key_var.get(),
+                    "model": model_id,
+                    "max_tokens": 50,
+                    "temperature": 0.1,
+                })
+
+                loop = asyncio.new_event_loop()
+                result = loop.run_until_complete(client.generate("回复OK", timeout=15))
+                loop.close()
+
+                test_dialog.destroy()
+                messagebox.showinfo("连接成功",
+                    f"供应商: {self.name_var.get()}\n模型: {model_id}\n响应: {result[:80]}")
+            except Exception as e:
+                test_dialog.destroy()
+                messagebox.showerror("连接失败", f"{self.name_var.get()}\n\n{str(e)[:200]}")
+
+        import threading
+        threading.Thread(target=do_test, daemon=True).start()

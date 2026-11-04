@@ -154,14 +154,34 @@ class InlineCommentGenerator:
     def __init__(self, llm_client: LLMClient):
         self.llm = llm_client
 
+    def _find_target(self, node: UnifiedASTNode) -> tuple:
+        """
+        找到行内注释的目标行
+        对于函数/方法节点，定位到函数体内第一个复杂语句（for/while/if/try）
+        返回 (目标行号, 注释针对的代码片段)
+        """
+        if node.node_type.value in ("function", "method"):
+            lines = node.source_text.split("\n")
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                # 跳过 def 行本身，找函数体内的第一个复杂语句
+                if i > 0 and stripped.startswith(("for ", "while ", "if ", "try:")):
+                    return node.start_line + i, stripped
+            # 没有复杂语句，指向函数体第一行
+            if len(lines) > 1:
+                return node.start_line + 1, lines[1].strip()
+        return node.start_line, node.source_text
+
     async def generate_for_statement(
         self, node: UnifiedASTNode, language: str, context: str = ""
     ) -> CommentSuggestion:
+        target_line, snippet = self._find_target(node)
+
         prompt = INLINE_COMMENT_TEMPLATE.render(
             language=language,
             context=context or " > ".join(node.scope_path),
-            line=node.start_line,
-            source_code=node.source_text,
+            line=target_line,
+            source_code=node.source_text if snippet == node.source_text else snippet,
         )
         result = await self.llm.generate(prompt)
         result = self._format_inline(result, language)
@@ -169,11 +189,11 @@ class InlineCommentGenerator:
         return CommentSuggestion(
             type=SuggestionType.INLINE_COMMENT,
             target_node_id=node.node_id,
-            target_line=node.start_line,
+            target_line=target_line,
             suggested_text=result,
             confidence=0.75,
             source="llm",
-            reasoning=f"Generated inline comment for line {node.start_line}",
+            reasoning=f"Generated inline comment for line {target_line}",
         )
 
     async def generate_for_complex_blocks(
@@ -218,7 +238,7 @@ class ImproveCommentGenerator:
             existing_comment=node.docstring,
             source_code=node.source_text,
         )
-        result = await self.llm.generate(prompt).strip()
+        result = (await self.llm.generate(prompt)).strip()
         if result == node.docstring.strip():
             return None
         return CommentSuggestion(
