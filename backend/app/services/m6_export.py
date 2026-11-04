@@ -41,7 +41,7 @@ class ExportService:
     ) -> str:
         """
         生成带注释的代码
-        核心算法：倒序插入，避免行号偏移
+        优先使用 LibCST Codemod（保留格式），回退到手动插入
         """
         if accepted_ids is not None:
             suggestions = [s for s in suggestions if s.suggestion_id in accepted_ids]
@@ -49,19 +49,97 @@ class ExportService:
         if not suggestions:
             return original_code
 
-        # 1. 计算所有插入点
+        # 分离 docstring 建议和行内注释建议
+        docstring_suggestions = [
+            s for s in suggestions
+            if s.type == SuggestionType.DOCSTRING
+        ]
+        other_suggestions = [
+            s for s in suggestions
+            if s.type != SuggestionType.DOCSTRING
+        ]
+
+        result_code = original_code
+
+        # 1. 优先用 LibCST Codemod 处理 docstring（保留所有格式）
+        if docstring_suggestions:
+            result_code = self._apply_docstrings_libcst(
+                result_code, docstring_suggestions, parse_result
+            )
+
+        # 2. 行内注释和其他类型用手动插入
+        if other_suggestions:
+            insertions = self._calculate_insertions(
+                other_suggestions, parse_result, result_code
+            )
+            insertions.sort(key=lambda x: x.line_number, reverse=True)
+            lines = result_code.split("\n")
+            for ins in insertions:
+                lines = self._insert_at(lines, ins)
+            result_code = "\n".join(lines)
+
+        return result_code
+
+    def _apply_docstrings_libcst(
+        self,
+        code: str,
+        suggestions: List[CommentSuggestion],
+        parse_result: ParseResult,
+    ) -> str:
+        """使用 LibCST Codemod 添加 docstring"""
+        try:
+            from app.services.libcst_parser import apply_docstrings_with_libcst
+
+            # 构建 {节点ID: docstring文本} 映射
+            # 通过 node_id 找到函数名
+            node_name_map = {}
+            self._build_node_name_map(parse_result.nodes, node_name_map)
+
+            docstrings = {}
+            for s in suggestions:
+                name = node_name_map.get(s.target_node_id)
+                if name:
+                    # 清理 docstring 文本（去除引号和缩进）
+                    text = s.suggested_text.strip()
+                    for q in ['"""', "'''"]:
+                        if text.startswith(q) and text.endswith(q):
+                            text = text[len(q):-len(q)].strip()
+                            break
+                    docstrings[name] = text
+
+            if docstrings:
+                result = apply_docstrings_with_libcst(code, docstrings)
+                # 验证语法
+                import ast
+                ast.parse(result)
+                return result
+        except Exception:
+            pass
+
+        # 回退到手动插入
+        return self._apply_docstrings_manual(code, suggestions, parse_result)
+
+    def _build_node_name_map(self, nodes, name_map: dict):
+        """递归构建 node_id → 函数/类名 的映射"""
+        for node in nodes:
+            if node.name and node.node_type.value in ("function", "method", "class"):
+                name_map[node.node_id] = node.name
+            self._build_node_name_map(node.children, name_map)
+
+    def _apply_docstrings_manual(
+        self,
+        code: str,
+        suggestions: List[CommentSuggestion],
+        parse_result: ParseResult,
+    ) -> str:
+        """手动插入 docstring（LibCST 不可用时的回退方案）"""
         insertions = self._calculate_insertions(
-            suggestions, parse_result, original_code
+            suggestions, parse_result, code
         )
-
-        # 2. 按行号倒序排序（从后往前插入，避免行号偏移）
         insertions.sort(key=lambda x: x.line_number, reverse=True)
-
-        # 3. 执行插入
-        lines = original_code.split("\n")
+        lines = code.split("\n")
         for ins in insertions:
             lines = self._insert_at(lines, ins)
-
         return "\n".join(lines)
 
     def _calculate_insertions(

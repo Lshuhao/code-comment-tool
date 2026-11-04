@@ -1,7 +1,10 @@
 """
 M2 AST解析层模块 - 多语言AST解析与统一中间表示生成
 职责：
-- 多语言AST解析（tree-sitter为主）
+- 多语言AST解析
+  - Python: LibCST为主（保留格式信息），tree-sitter/stdlib ast回退
+  - Java: tree-sitter为主，正则回退
+  - C++: tree-sitter为主，正则回退
 - 统一UnifiedASTNode中间表示生成
 - 复杂度评分、行号映射、scope_path
 """
@@ -30,8 +33,8 @@ class LanguageParser(ABC):
 
 class PythonParser(LanguageParser):
     """
-    Python解析器 - 使用tree-sitter-python
-    如tree-sitter不可用，回退到标准库ast模块
+    Python解析器 - LibCST为主（保留格式信息）
+    回退顺序：LibCST → tree-sitter → stdlib ast
     """
 
     def get_language(self) -> str:
@@ -39,10 +42,23 @@ class PythonParser(LanguageParser):
 
     def parse(self, source_code: str) -> ParseResult:
         """解析Python源代码"""
+        # 1. 优先使用 LibCST（保留所有格式信息）
+        try:
+            from app.services.libcst_parser import parse_with_libcst
+            return parse_with_libcst(source_code)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # 2. 回退到 tree-sitter
         try:
             return self._parse_with_tree_sitter(source_code)
         except Exception:
-            return self._parse_with_ast(source_code)
+            pass
+
+        # 3. 回退到 stdlib ast
+        return self._parse_with_ast(source_code)
 
     def _parse_with_tree_sitter(self, source_code: str) -> ParseResult:
         """使用tree-sitter解析"""
@@ -469,13 +485,23 @@ class PythonParser(LanguageParser):
 
 
 class JavaParser(LanguageParser):
-    """Java解析器 - 使用tree-sitter-java"""
+    """Java解析器 - javalang为主（完整Javadoc解析），tree-sitter回退"""
 
     def get_language(self) -> str:
         return "java"
 
     def parse(self, source_code: str) -> ParseResult:
         """解析Java源代码"""
+        # 1. 优先使用 javalang（完整Javadoc结构化解析）
+        try:
+            from app.services.javalang_parser import parse_with_javalang
+            return parse_with_javalang(source_code)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # 2. 回退到 tree-sitter
         try:
             import tree_sitter_java as tspjava
             from tree_sitter import Language, Parser
