@@ -59,44 +59,48 @@ class AnalysisPage(ttk.Frame):
         self.score_overview = ScoreOverview(self)
         self.score_overview.pack(fill=tk.X, pady=4)
 
-        # 垂直分栏：上方代码区 + 下方建议/缺陷区
-        main_vertical = ttk.PanedWindow(self, orient=tk.VERTICAL)
-        main_vertical.pack(fill=tk.BOTH, expand=True)
+        # 底部操作栏（先 pack，固定在底部）
+        action_bar = ttk.Frame(self)
+        action_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(4, 0))
+        ttk.Button(action_bar, text="导出源码", command=lambda: self._export("source")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_bar, text="导出Markdown报告", command=lambda: self._export("markdown")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_bar, text="导出HTML报告", command=lambda: self._export("html")).pack(side=tk.LEFT, padx=2)
 
-        # 上半部分：代码输入 + 代码对比
-        top_frame = ttk.Frame(main_vertical)
+        self.status_label = ttk.Label(action_bar, text="就绪", foreground="#888")
+        self.status_label.pack(side=tk.RIGHT, padx=8)
+
+        # 垂直分栏：上方代码区 + 下方建议/缺陷区（填充剩余空间）
+        self.main_vertical = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        self.main_vertical.pack(fill=tk.BOTH, expand=True)
+
+        # 上半部分：代码输入 + 注释后代码
+        top_frame = ttk.Frame(self.main_vertical)
 
         code_pane = ttk.PanedWindow(top_frame, orient=tk.HORIZONTAL)
         code_pane.pack(fill=tk.BOTH, expand=True)
 
-        # 左侧：代码输入
         left_frame = ttk.LabelFrame(code_pane, text="代码输入")
         self.code_text = scrolledtext.ScrolledText(left_frame, wrap=tk.NONE,
                                                     font=("Consolas", 11), height=10)
         self.code_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         code_pane.add(left_frame, weight=1)
 
-        # 右侧：注释后代码（只显示注释后的结果）
         right_frame = ttk.LabelFrame(code_pane, text="注释后代码")
-
         self.annot_text = scrolledtext.ScrolledText(right_frame, wrap=tk.NONE,
                                                      font=("Consolas", 10), state=tk.DISABLED,
                                                      bg="#f0fff0", height=10)
         self.annot_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-
         code_pane.add(right_frame, weight=1)
 
         top_frame.pack(fill=tk.BOTH, expand=True)
-        main_vertical.add(top_frame, weight=1)
+        self.main_vertical.add(top_frame, weight=1)
 
-        # 下半部分：统一的建议+缺陷面板
-        bottom_frame = ttk.Frame(main_vertical)
+        # 下半部分：建议+缺陷（随窗口缩放）
+        bottom_frame = ttk.Frame(self.main_vertical)
 
-        # 使用 Notebook 合并建议和缺陷
         self.bottom_notebook = ttk.Notebook(bottom_frame)
         self.bottom_notebook.pack(fill=tk.BOTH, expand=True)
 
-        # 建议 Tab
         suggest_frame = ttk.Frame(self.bottom_notebook)
         self.suggestion_list = SuggestionList(suggest_frame,
                                                on_accept=self._on_accept,
@@ -104,24 +108,25 @@ class AnalysisPage(ttk.Frame):
         self.suggestion_list.pack(fill=tk.BOTH, expand=True)
         self.bottom_notebook.add(suggest_frame, text="  注释建议  ")
 
-        # 缺陷 Tab
         defect_frame = ttk.Frame(self.bottom_notebook)
         self.defect_panel = DefectPanel(defect_frame)
         self.defect_panel.pack(fill=tk.BOTH, expand=True)
         self.bottom_notebook.add(defect_frame, text="  缺陷检测  ")
 
         bottom_frame.pack(fill=tk.BOTH, expand=True)
-        main_vertical.add(bottom_frame, weight=1)
+        self.main_vertical.add(bottom_frame, weight=1)
 
-        # 底部操作栏
-        action_bar = ttk.Frame(self)
-        action_bar.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(action_bar, text="导出源码", command=lambda: self._export("source")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(action_bar, text="导出Markdown报告", command=lambda: self._export("markdown")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(action_bar, text="导出HTML报告", command=lambda: self._export("html")).pack(side=tk.LEFT, padx=2)
+        # 延迟设置分隔条位置（代码区60% / 建议区40%）
+        self.after(200, self._set_sash_position)
 
-        self.status_label = ttk.Label(action_bar, text="就绪", foreground="#888")
-        self.status_label.pack(side=tk.RIGHT, padx=8)
+    def _set_sash_position(self):
+        """设置 PanedWindow 分隔条初始位置"""
+        try:
+            total_height = self.main_vertical.winfo_height()
+            if total_height > 200:
+                self.main_vertical.sashpos(0, int(total_height * 0.60))
+        except Exception:
+            pass
 
     def _open_file(self):
         path = filedialog.askopenfilename(
@@ -334,12 +339,14 @@ class AnalysisPage(ttk.Frame):
                     messagebox.showinfo("成功", f"源码已导出到：\n{path}")
 
             elif fmt == "markdown":
+                from app.models.suggestions import Defect, CommentSuggestion
                 score = QualityScore(**{k: v for k, v in score_data.items()
                                         if k in ("score", "dimensions", "defect_stats", "summary")})
-                result = export_service.export_markdown_report(
-                    score, self._current_task.get("defects", []),
-                    self._current_task.get("suggestions", [])
-                )
+                defects = [Defect.from_dict(d) if isinstance(d, dict) else d
+                           for d in self._current_task.get("defects", [])]
+                suggestions = [CommentSuggestion.from_dict(s) if isinstance(s, dict) else s
+                               for s in self._current_task.get("suggestions", [])]
+                result = export_service.export_markdown_report(score, defects, suggestions)
                 path = filedialog.asksaveasfilename(
                     title="导出Markdown报告",
                     defaultextension=".md",
@@ -352,11 +359,15 @@ class AnalysisPage(ttk.Frame):
                     messagebox.showinfo("成功", f"Markdown报告已导出到：\n{path}")
 
             elif fmt == "html":
+                from app.models.suggestions import Defect, CommentSuggestion
                 score = QualityScore(**{k: v for k, v in score_data.items()
                                         if k in ("score", "dimensions", "defect_stats", "summary")})
+                defects = [Defect.from_dict(d) if isinstance(d, dict) else d
+                           for d in self._current_task.get("defects", [])]
+                suggestions = [CommentSuggestion.from_dict(s) if isinstance(s, dict) else s
+                               for s in self._current_task.get("suggestions", [])]
                 result = export_service.export_html_report(
-                    score, self._current_task.get("defects", []),
-                    self._current_task.get("suggestions", []),
+                    score, defects, suggestions,
                     self._current_task.get("original_code", ""),
                     self._current_task.get("annotated_code", ""),
                 )

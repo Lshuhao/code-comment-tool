@@ -12,7 +12,6 @@ from jinja2 import Template
 
 from app.models.unified_ast import UnifiedASTNode, NodeType, ParseResult
 from app.models.suggestions import CommentSuggestion, SuggestionType
-from app.core.config import settings
 
 
 # 从独立的 llm_client 模块导入
